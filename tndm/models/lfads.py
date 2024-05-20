@@ -12,6 +12,8 @@ from .model_loader import ModelLoader
 
 tf.config.run_functions_eagerly(True)
 
+# quantize
+from qkeras import QGRU, QDense, QBidirectional, QActivation
 
 class LFADS(ModelLoader, tf.keras.Model):
 
@@ -47,6 +49,41 @@ class LFADS(ModelLoader, tf.keras.Model):
 
         self.neural_loglike_loss = poisson_loglike_loss(self.timestep)
         
+        self.quantized: bool = bool(ArgsParser.get_or_default(
+            kwargs, 'quantized', False))
+        self.encoder_quantized: bool = bool(ArgsParser.get_or_default(
+            kwargs, 'encoder_quantized', False))
+        self.total_bit: int = int(ArgsParser.get_or_default(
+            kwargs, 'total_bit', 16))
+        self.int_bit_weight: int = int(ArgsParser.get_or_default(
+            kwargs, 'int_bit_weight', 1))
+            
+        # for 16, 24, 12, 10
+        self.int_bit: int = int(ArgsParser.get_or_default(
+            kwargs, 'int_bit', 6))
+        # for 8, 6, 4
+        self.int_bit_big: int = int(ArgsParser.get_or_default(
+            kwargs, 'int_bit_big', 6))
+        self.int_bit_small: int = int(ArgsParser.get_or_default(
+            kwargs, 'int_bit_small', 2))
+            
+        self.high_bit = bool(self.total_bit > 8)
+            
+        # Quantize
+        # For higher bit, there is no difference between act_quan_big and act_quan_small
+        if self.high_bit:
+            self.act_quan_big = "quantized_bits({},{},alpha=1)".format(self.total_bit, self.int_bit)
+            self.act_quan_small = "quantized_bits({},{},alpha=1)".format(self.total_bit, self.int_bit)
+            self.gru_quan = "quantized_bits({},{},alpha=1)".format(self.total_bit, self.int_bit_weight)
+            self.act_quan_sigmoid = "quantized_sigmoid({})".format(self.total_bit)
+            self.act_quan_tanh = "quantized_tanh({})".format(self.total_bit)
+        else:
+            self.act_quan_big = "quantized_bits({},{},alpha=1)".format(16, self.int_bit_big)
+            self.act_quan_small = "quantized_bits({},{},alpha=1)".format(self.total_bit, self.int_bit_small)
+            self.gru_quan = "quantized_bits({},{},alpha=1)".format(self.total_bit, self.int_bit_weight)
+            self.act_quan_sigmoid = "quantized_sigmoid({})".format(self.total_bit)
+            self.act_quan_tanh = "quantized_tanh({})".format(self.total_bit)
+            
         layers = ArgsParser.get_or_default(kwargs, 'layers', {})
         if not isinstance(layers, defaultdict):
             layers: Dict[str, Any] = defaultdict(
@@ -76,24 +113,60 @@ class LFADS(ModelLoader, tf.keras.Model):
             encoder_args, 'var_min', .0001)
         self.encoded_var_trainable: bool = ArgsParser.get_or_default_and_remove(
             encoder_args, 'var_trainable', True)
-
-        forward_layer = tf.keras.layers.GRU(
-            self.encoder_dim, time_major=False, name="EncoderGRUForward", return_state=True, **encoder_args)
-        backward_layer = tf.keras.layers.GRU(
-            self.encoder_dim, time_major=False, name="EncoderGRUBackward", return_state=True, go_backwards=True, **encoder_args)
-        self.encoder = tf.keras.layers.Bidirectional(
-            forward_layer, backward_layer=backward_layer, name='EncoderRNN', merge_mode='concat')
+        if self.quantized or self.encoder_quantized:
+            forward_layer = QGRU(
+                self.encoder_dim, time_major=False, name="EncoderGRUForward", return_state=False, reset_after=True, **encoder_args,
+                activation=self.act_quan_tanh,
+                recurrent_activation=self.act_quan_sigmoid,
+                kernel_quantizer=self.gru_quan,
+                recurrent_quantizer=self.gru_quan,
+                bias_quantizer=self.gru_quan,
+                state_quantizer=self.act_quan_small)
+            backward_layer = QGRU(
+                self.encoder_dim, time_major=False, name="EncoderGRUBackward", return_state=False, reset_after=True, go_backwards=True, **encoder_args,
+                activation=self.act_quan_tanh,
+                recurrent_activation=self.act_quan_sigmoid,
+                kernel_quantizer=self.gru_quan,
+                recurrent_quantizer=self.gru_quan,
+                bias_quantizer=self.gru_quan,
+                state_quantizer=self.act_quan_small)
+            self.encoder = QBidirectional(
+                forward_layer, backward_layer=backward_layer, name='EncoderRNN', merge_mode='concat')  
+            self.q_act_postencoder = QActivation(self.act_quan_small, name = "q_act_postencoder")
+        else:
+            forward_layer = tf.keras.layers.GRU(
+                self.encoder_dim, time_major=False, name="EncoderGRUForward", return_state=False, **encoder_args)
+            backward_layer = tf.keras.layers.GRU(
+                self.encoder_dim, time_major=False, name="EncoderGRUBackward", return_state=False, go_backwards=True, **encoder_args)
+            self.encoder = tf.keras.layers.Bidirectional(
+                forward_layer, backward_layer=backward_layer, name='EncoderRNN', merge_mode='concat')
         self.dropout_post_encoder = tf.keras.layers.Dropout(self.dropout)
         self.dropout_post_decoder = tf.keras.layers.Dropout(self.dropout)
         
         # DISTRIBUTION
-        self.dense_mean = tf.keras.layers.Dense(
-            self.initial_condition_dim, name="DenseMean", **layers['dense_mean'])
-        self.dense_logvar = tf.keras.layers.Dense(
-            self.initial_condition_dim, name="DenseLogVar", **layers['dense_logvar'])
+        if self.quantized:
+            self.dense_mean = QDense(
+                self.initial_condition_dim,
+                kernel_quantizer=self.gru_quan,
+                bias_quantizer=self.gru_quan,
+                name="DenseMean", **layers['dense_mean'])
+            self.dense_logvar = QDense(
+                self.initial_condition_dim,
+                kernel_quantizer=self.gru_quan,
+                bias_quantizer=self.gru_quan,
+                name="DenseLogVar", **layers['dense_logvar'])
+            self.q_act_dense_mean = QActivation(self.act_quan_big, name = "q_act_dense_mean")
+            self.q_act_dense_logvar = QActivation(self.act_quan_small, name = "q_act_dense_logvar")
+        else:
+            self.dense_mean = tf.keras.layers.Dense(
+                self.initial_condition_dim, name="DenseMean", **layers['dense_mean'])
+            self.dense_logvar = tf.keras.layers.Dense(
+                self.initial_condition_dim, name="DenseLogVar", **layers['dense_logvar'])
 
         # SAMPLING
         self.sampling = GaussianSampling(name="GaussianSampling")
+        if self.quantized:
+            self.q_act_postsampling = QActivation(self.act_quan_big, name = "q_act_postsampling")
 
         # DECODERS
         if self.decoder_dim != self.initial_condition_dim:
@@ -108,16 +181,43 @@ class LFADS(ModelLoader, tf.keras.Model):
             self.decoder = tf.keras.layers.RNN(
                 decoder_cell, return_sequences=True, time_major=False, name='DecoderGRU')
         else:
-            self.decoder = tf.keras.layers.GRU(
-                self.decoder_dim, return_sequences=True, time_major=False, name='DecoderGRU', **decoder_args)
+            if self.quantized:
+                self.decoder = QGRU(
+                    self.decoder_dim, return_sequences=True, time_major=False, reset_after=True, name='DecoderGRU', **decoder_args,
+                    activation=self.act_quan_tanh,
+                    recurrent_activation=self.act_quan_sigmoid,
+                    kernel_quantizer=self.gru_quan,
+                    recurrent_quantizer=self.gru_quan,
+                    bias_quantizer=self.gru_quan,
+                    state_quantizer=self.act_quan_small)
+                self.q_act_predecoder = QActivation(self.act_quan_big, name = "q_act_predecoder")
+                self.q_act_postdecoder = QActivation(self.act_quan_big, name = "q_act_postdecoder")
+            else:
+                self.decoder = tf.keras.layers.GRU(
+                    self.decoder_dim, return_sequences=True, time_major=False, name='DecoderGRU', **decoder_args)
 
         # DIMENSIONALITY REDUCTION
-        self.dense = tf.keras.layers.Dense(
-            self.factors, use_bias=False, name="Dense", **layers['dense'])
+        if self.quantized:
+            self.dense = QDense(
+                self.factors, use_bias=False,
+                kernel_quantizer=self.gru_quan,
+                bias_quantizer=self.gru_quan,
+                name="Dense", **layers['dense'])
+            self.q_act_postdense = QActivation(self.act_quan_small, name = "q_act_postdense")
+        else:
+            self.dense = tf.keras.layers.Dense(
+                self.factors, use_bias=False, name="Dense", **layers['dense'])
 
         # NEURAL
-        self.neural_dense = tf.keras.layers.Dense(
-            self.neural_dim, name="NeuralDense", **layers['neural_dense'])
+        if self.quantized:
+            self.neural_dense = QDense(
+                self.neural_dim,
+                kernel_quantizer=self.gru_quan,
+                bias_quantizer=self.gru_quan,
+                name="NeuralDense", **layers['neural_dense'])
+        else:
+            self.neural_dense = tf.keras.layers.Dense(
+                self.neural_dim, name="NeuralDense", **layers['neural_dense'])
 
     @staticmethod
     def load(filename) -> LFADS:
@@ -136,14 +236,59 @@ class LFADS(ModelLoader, tf.keras.Model):
             prior_variance=self.prior_variance,
             layers=self.layers_settings,
             default_layer_settings=self.layers_settings.default_factory(),
-            full_logs=self.full_logs
+            full_logs=self.full_logs,
+            quantized=self.quantized,
+            encoder_quantized=self.encoder_quantized,
+            total_bit=self.total_bit,
+            int_bit_weight=self.int_bit_weight,
+            int_bit=self.int_bit,
+            int_bit_big=self.int_bit_big,
+            int_bit_small=self.int_bit_small
         )
+    
+    def load_model_weight(self, source_LFAD_model):
+        self.encoder.set_weights(source_LFAD_model.get_layer("EncoderRNN").get_weights())
+        self.dense_mean.set_weights(source_LFAD_model.get_layer("DenseMean").get_weights())
+        self.dense_logvar.set_weights(source_LFAD_model.get_layer("DenseLogVar").get_weights())
+        self.decoder.set_weights(source_LFAD_model.get_layer("DecoderGRU").get_weights())
+        self.dense.set_weights(source_LFAD_model.get_layer("Dense").get_weights())
+        self.neural_dense.set_weights(source_LFAD_model.get_layer("NeuralDense").get_weights())
 
     @tf.function
     def call(self, inputs, training: bool = True):
         g0, mean, logvar = self.encode(inputs, training=training)
         log_f, z = self.decode(g0, inputs, training=training)
         return log_f, (g0, mean, logvar), z
+    
+    @tf.function
+    def encode(self, inputs, training: bool = True):
+        dropped_neural = self.initial_dropout(inputs, training=training)
+        encoded = self.encoder(dropped_neural, training=training)
+        if self.quantized or self.encoder_quantized:
+            encoded = self.q_act_postencoder(encoded)
+        dropped_encoded = self.dropout_post_encoder(encoded, training=training)
+
+        mean = self.dense_mean(dropped_encoded, training=training)
+        if self.quantized:
+            qmean = self.q_act_dense_mean(mean)
+
+        if self.encoded_var_trainable:
+            logvar = tf.math.log(tf.exp(self.dense_logvar(
+                dropped_encoded, training=training)) + self.encoded_var_min)
+        else:
+            logvar = tf.zeros_like(mean) + tf.math.log(self.encoded_var_min)
+        
+        if self.quantized:
+            qlogvar = self.q_act_dense_logvar(logvar)
+        if self.quantized:
+            g0 = self.sampling(
+                tf.stack([qmean, qlogvar], axis=-1), training=training)
+        else:
+            g0 = self.sampling(
+                tf.stack([mean, logvar], axis=-1), training=training)
+        if self.quantized:
+            g0 = self.q_act_postsampling(g0)
+        return g0, mean, logvar
 
     @tf.function
     def decode(self, g0, inputs, training: bool = True):
@@ -157,9 +302,19 @@ class LFADS(ModelLoader, tf.keras.Model):
             g0_pre_decoder = self.pre_decoder_activation(g0) # Not in the original
         else:
             g0_pre_decoder = g0
+        
+        if self.quantized:
+            g0_pre_decoder = self.q_act_predecoder(g0_pre_decoder)
+        
         g = self.decoder(u, initial_state=g0_pre_decoder, training=training)
+        if self.quantized:
+            g = self.q_act_postdecoder(g)
+        
         dropped_g = self.dropout_post_decoder(g, training=training) #dropout after GRU
         z = self.dense(dropped_g, training=training)
+        
+        if self.quantized:
+            z = self.q_act_postdense(z)
 
         # clipping the log-firingrate log(self.timestep) so that the
         # log-likelihood does not return NaN
@@ -177,24 +332,6 @@ class LFADS(ModelLoader, tf.keras.Model):
                 list(log_f.shape), list(inputs.shape))])
 
         return log_f, z
-
-    @tf.function
-    def encode(self, inputs, training: bool = True):
-        dropped_neural = self.initial_dropout(inputs, training=training)
-        encoded = self.encoder(dropped_neural, training=training)[0]
-        dropped_encoded = self.dropout_post_encoder(encoded, training=training)
-
-        mean = self.dense_mean(dropped_encoded, training=training)
-
-        if self.encoded_var_trainable:
-            logvar = tf.math.log(tf.exp(self.dense_logvar(
-                dropped_encoded, training=training)) + self.encoded_var_min)
-        else:
-            logvar = tf.zeros_like(mean) + tf.math.log(self.encoded_var_min)
-
-        g0 = self.sampling(
-            tf.stack([mean, logvar], axis=-1), training=training)
-        return g0, mean, logvar
 
     def compile(self, optimizer, loss_weights, *args, **kwargs):
         super(LFADS, self).compile(
