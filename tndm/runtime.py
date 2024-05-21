@@ -142,6 +142,64 @@ class Runtime(object):
         return model, history
 
     @staticmethod
+    def get_model(model_type: Union[str, ModelType], model_settings: Dict[str, Any], optimizer: tf.optimizers.Optimizer, epochs: int,
+              train_dataset: Tuple[tf.Tensor, tf.Tensor], adaptive_weights: AdaptiveWeights,
+              val_dataset: Optional[Tuple[tf.Tensor, tf.Tensor]] = None, batch_size: Optional[int] = None, logdir: Optional[str] = None,
+              adaptive_lr: Optional[Union[dict, tf.keras.callbacks.Callback]] = None, layers_settings: Dict[str, Any] = {},
+              terminating_lr: Optional[float]=None, verbose: Optional[int] = 2):
+
+        if isinstance(model_type, str):
+            model_type = ModelType.from_string(model_type)
+
+        if layers_settings is None:
+            layers_settings = {}
+
+        (x, y), validation_data = Runtime.clean_datasets(
+            train_dataset, val_dataset, model_type.with_behaviour)
+
+        if model_type == ModelType.TNDM:
+            model_settings.update(
+                neural_dim=x.shape[-1],
+                behaviour_dim=y.shape[-1],
+            )
+            model = TNDM(
+                **model_settings,
+                layers=layers_settings
+            )
+        elif model_type == ModelType.LFADS:
+            model_settings.update(
+                neural_dim=x.shape[-1],
+            )
+            model = LFADS(
+                **model_settings,
+                layers=layers_settings
+            )
+        else:
+            raise NotImplementedError(
+                'This model type has not been implemented yet')
+
+        callbacks = [adaptive_weights]
+        if logdir is not None:
+            callbacks.append(tf.keras.callbacks.TensorBoard(log_dir=logdir))
+        if adaptive_lr is not None:
+            if isinstance(adaptive_lr, tf.keras.callbacks.Callback):
+                callbacks.append(adaptive_lr)
+            else:
+                callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor='val_loss/reconstruction', **adaptive_lr))
+        if terminating_lr is not None:
+            callbacks.append(LearningRateStopping(terminating_lr))
+
+        model.build(input_shape=[None] + list(x.shape[1:]))
+
+        model.compile(
+            optimizer=optimizer,
+            loss_weights=adaptive_weights.w
+        )
+
+        return model, x, y, validation_data, callbacks, adaptive_weights
+
+    @staticmethod
     def train_from_file(settings_path: str):
         start_time=datetime.utcnow()
 
