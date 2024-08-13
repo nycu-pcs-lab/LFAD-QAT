@@ -76,6 +76,15 @@ class Runtime(object):
               adaptive_lr: Optional[Union[dict, tf.keras.callbacks.Callback]] = None, layers_settings: Dict[str, Any] = {},
               terminating_lr: Optional[float]=None, verbose: Optional[int] = 2):
 
+        if 'seed' in model_settings.keys():
+            seed = model_settings['seed']
+        else:
+            seed = np.random.randint(0, 2**32 - 1)
+        np.random.seed(seed)
+        tf.random.set_seed(seed)
+        logger.info('Seed was set to %d' % (seed))
+        print('Seed was set to %d' % (seed))
+        
         if isinstance(model_type, str):
             model_type = ModelType.from_string(model_type)
 
@@ -148,6 +157,15 @@ class Runtime(object):
               adaptive_lr: Optional[Union[dict, tf.keras.callbacks.Callback]] = None, layers_settings: Dict[str, Any] = {},
               terminating_lr: Optional[float]=None, verbose: Optional[int] = 2):
 
+        if 'seed' in model_settings.keys():
+            seed = model_settings['seed']
+        else:
+            seed = np.random.randint(0, 2**32 - 1)
+        np.random.seed(seed)
+        tf.random.set_seed(seed)
+        logger.info('Seed was set to %d' % (seed))
+        print('Seed was set to %d' % (seed))
+        
         if isinstance(model_type, str):
             model_type = ModelType.from_string(model_type)
 
